@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: Test & build Mac app
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit & component tests
+        run: npm test
+
+      - name: Rust tests (real macOS APIs compiled)
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Rust lint
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      - name: Install browsers for end-to-end tests
+        run: npx playwright install chromium webkit
+
+      - name: End-to-end tests (Chromium + WebKit)
+        run: npm run test:e2e
+        env:
+          E2E_WEBKIT: "1"
+
+      - name: Build universal Mac app (Apple Silicon + Intel)
+        run: npm run tauri -- build --target universal-apple-darwin
+
+      - name: Verify the app bundle
+        run: |
+          APP="src-tauri/target/universal-apple-darwin/release/bundle/macos/Momentum.app"
+          test -d "$APP"
+          lipo -archs "$APP/Contents/MacOS/momentum"
+          codesign --verify --verbose "$APP"
+          ls -la src-tauri/target/universal-apple-darwin/release/bundle/dmg/
+
+      - name: Upload .dmg
+        uses: actions/upload-artifact@v4
+        with:
+          name: Momentum-macOS-dmg
+          path: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+
+      - name: Publish the .dmg as a GitHub Release (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          DMG=$(ls src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg | head -1)
+          TAG="build-${{ github.run_number }}"
+          gh release create "$TAG" "$DMG" \
+            --target "${{ github.sha }}" \
+            --title "Momentum build ${{ github.run_number }}" \
+            --notes "Universal Mac app (Apple Silicon + Intel) built from ${{ github.sha }}. Unsigned: on first launch use System Settings → Privacy & Security → Open Anyway." \
+            --latest
+
+      - name: Upload test screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-results
+          path: test-results/
+          if-no-files-found: ignore
